@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -613,34 +614,80 @@ func (s *h2ProxySession) Close() error {
 // h3ProxySession holds a single QUIC connection used for HTTP/3 CONNECT tunnels.
 type h3ProxySession struct {
 	conn      *quic.Conn
+	udpConn   *net.UDPConn
 	rt        *http3.Transport
 	proxyHost string
 	token     string
 }
 
 func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (*h3ProxySession, error) {
-	proxyHost := proxyURL.Host
-	if proxyURL.Port() == "" {
-		proxyHost = proxyURL.Hostname() + ":443"
+	host := proxyURL.Hostname()
+	portStr := proxyURL.Port()
+	if portStr == "" {
+		portStr = "443"
 	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy port %q: %w", portStr, err)
+	}
+	proxyHost := net.JoinHostPort(host, portStr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", host)
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName: host,
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h3"},
+	}
 	quicCfg := &quic.Config{
 		KeepAlivePeriod: 30 * time.Second,
 	}
-	conn, err := quic.DialAddr(ctx, proxyHost, &tls.Config{
-		ServerName: proxyURL.Hostname(),
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"h3"},
-	}, quicCfg)
-	if err != nil {
-		return nil, err
+
+	perAttempt := timeout / time.Duration(len(ips))
+	if perAttempt < 3*time.Second {
+		perAttempt = 3 * time.Second
+	}
+
+	var (
+		conn    *quic.Conn
+		udpConn *net.UDPConn
+		lastErr error
+	)
+	for _, ip := range ips {
+		uc, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		udpAddr := &net.UDPAddr{IP: ip.AsSlice(), Port: port, Zone: ip.Zone()}
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, perAttempt)
+		c, err := quic.Dial(attemptCtx, uc, udpAddr, tlsCfg, quicCfg)
+		attemptCancel()
+		if err != nil {
+			_ = uc.Close()
+			lastErr = fmt.Errorf("dial %s: %w", udpAddr, err)
+			continue
+		}
+		conn = c
+		udpConn = uc
+		break
+	}
+	if conn == nil {
+		return nil, lastErr
 	}
 
 	if conn.ConnectionState().TLS.NegotiatedProtocol != "h3" {
 		_ = conn.CloseWithError(0, "")
+		_ = udpConn.Close()
 		return nil, errProxyHTTP3Unavailable
 	}
 
@@ -652,6 +699,7 @@ func newH3ProxySession(proxyURL *url.URL, token string, timeout time.Duration) (
 
 	return &h3ProxySession{
 		conn:      conn,
+		udpConn:   udpConn,
 		rt:        rt,
 		proxyHost: proxyHost,
 		token:     token,
@@ -696,10 +744,16 @@ func (s *h3ProxySession) Close() error {
 	if s.rt != nil {
 		_ = s.rt.Close()
 	}
+	var err error
 	if s.conn != nil {
-		return s.conn.CloseWithError(0, "")
+		err = s.conn.CloseWithError(0, "")
 	}
-	return nil
+	if s.udpConn != nil {
+		if closeErr := s.udpConn.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 type tunnelConn struct {
