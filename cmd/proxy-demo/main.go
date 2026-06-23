@@ -71,6 +71,7 @@ func main() {
 	guardianFlag := flag.String("guardian", vpnclient.GuardianEndpointDefault, "Guardian API endpoint")
 	listenFlag := flag.String("listen", "127.0.0.1:1080", "Local SOCKS5 listen address")
 	loginFlag := flag.Bool("login", false, "Force fresh login (ignore saved refresh token)")
+	sessionTokenFlag := flag.String("session-token", "", "Use existing session token directly")
 	printInfoFlag := flag.Bool("print-info", false, "Print user info, quota info, and server list, then exit")
 	proxyFlag := flag.String("proxy", "", "Upstream proxy URL or host:port; random CONNECT server if omitted")
 	timeoutFlag := flag.Duration("timeout", 20*time.Second, "Upstream dial and handshake timeout")
@@ -79,6 +80,7 @@ func main() {
 
 	runtimeAuth, tokenSource, countries := prepareDemoInputs(
 		*loginFlag,
+		strings.TrimSpace(*sessionTokenFlag),
 		strings.TrimSpace(*proxyFlag) == "",
 	)
 
@@ -156,8 +158,24 @@ func main() {
 	}
 }
 
-func prepareDemoInputs(forceLogin, needServerList bool) (*runtimeAuth, string, []vpnclient.Country) {
-	token, tokenSource := obtainOAuthToken(forceLogin)
+func prepareDemoInputs(forceLogin bool, sessionToken string, needServerList bool) (*runtimeAuth, string, []vpnclient.Country) {
+
+	var token *vpnclient.TokenResponse
+	var tokenSource string
+
+	if sessionToken != "" {
+		fmt.Print("Using provided session token... ")
+		var err error
+		token, err = vpnclient.FxaOAuthToken(sessionToken)
+		if err != nil {
+			fmt.Printf("failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("OK")
+		tokenSource = "session-token flag"
+	} else {
+		token, tokenSource = obtainOAuthToken(forceLogin)
+	}
 
 	if err := vpnclient.SaveTokens(token); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save tokens: %v\n", err)
